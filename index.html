@@ -987,6 +987,14 @@
             state.rolling = false;
             renderDice(false);
             updateScores();
+
+            // Exact-Score Win: if every scoring subset of this roll would overshoot,
+            // the player has no playable selection — treat it as a bust.
+            if (activeRuleset.rules.exactScoreWin && !hasNonOvershootingSubset()) {
+                handleFarkle(freshValues, 'overshoot');
+                return;
+            }
+
             updateButtonStates();
         }, 900);
     }
@@ -1003,25 +1011,16 @@
             if (!state.scoringIndices.includes(globalIdx)) return;  // non-scoring, ignore
 
             // Exact-Score Win: reject adds that would push the projected total past the
-            // target. Escape hatch — when the current selection is empty and NO subset of
-            // available scoring dice fits under the target, allow the click so the player
-            // isn't deadlocked (they'll be forced to keep rolling and risk a bust). Once
-            // a click has already pushed us into overshoot territory, further clicks are
-            // allowed too — there's no point gating once the bust path is committed.
+            // target. (The unwinnable "every combo overshoots" case can't reach this code
+            // because onRollClick auto-busts the roll before any click is possible.)
             if (activeRuleset.rules.exactScoreWin) {
                 const myScore = state.scores[state.currentPlayer] || 0;
-                const currentProjected = myScore + state.turnTotal + state.rollScore;
-                if (currentProjected <= state.winScore) {
-                    const tentativeValues = [...state.selected, globalIdx].map(i => state.dice[i]);
-                    const tentativeScore = evaluate(tentativeValues).score;
-                    const projected = myScore + state.turnTotal + tentativeScore;
-                    if (projected > state.winScore) {
-                        const hasAlternative = state.selected.size > 0 || hasNonOvershootingSubset();
-                        if (hasAlternative) {
-                            showOvershootRejection();
-                            return;
-                        }
-                    }
+                const tentativeValues = [...state.selected, globalIdx].map(i => state.dice[i]);
+                const tentativeScore = evaluate(tentativeValues).score;
+                const projected = myScore + state.turnTotal + tentativeScore;
+                if (projected > state.winScore) {
+                    showOvershootRejection();
+                    return;
                 }
             }
 
@@ -1139,17 +1138,23 @@
         els.ruleHint.textContent = '';
     }
 
-    function handleFarkle(roll) {
+    function handleFarkle(roll, reason = 'no-scoring') {
         playFarkle();
-        els.statusMessage.textContent = 'BUST!';
+        els.statusMessage.textContent = reason === 'overshoot'
+            ? 'BUST! Every combo would overshoot the target.'
+            : 'BUST!';
         els.statusMessage.className = 'farkle';
 
         state.farkleStreak[state.currentPlayer]++;
         state.turnTotal = 0;
         state.rollScore = 0;
+        state.selected.clear();
+        state.scoringIndices = [];
 
-        let msg = `${state.players[state.currentPlayer]} busted on [${roll.join(', ')}]!`;
-        let subtitle = null;
+        let msg = reason === 'overshoot'
+            ? `${state.players[state.currentPlayer]} busted — every scoring combo on [${roll.join(', ')}] would overshoot the target!`
+            : `${state.players[state.currentPlayer]} busted on [${roll.join(', ')}]!`;
+        let subtitle = reason === 'overshoot' ? 'OVERSHOOT BUST' : null;
 
         const penalty = activeRuleset.rules.tripleFarklePenalty;
         if (penalty && state.farkleStreak[state.currentPlayer] >= 3) {
