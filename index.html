@@ -1001,6 +1001,30 @@
             state.selected.delete(globalIdx);
         } else {
             if (!state.scoringIndices.includes(globalIdx)) return;  // non-scoring, ignore
+
+            // Exact-Score Win: reject adds that would push the projected total past the
+            // target. Escape hatch — when the current selection is empty and NO subset of
+            // available scoring dice fits under the target, allow the click so the player
+            // isn't deadlocked (they'll be forced to keep rolling and risk a bust). Once
+            // a click has already pushed us into overshoot territory, further clicks are
+            // allowed too — there's no point gating once the bust path is committed.
+            if (activeRuleset.rules.exactScoreWin) {
+                const myScore = state.scores[state.currentPlayer] || 0;
+                const currentProjected = myScore + state.turnTotal + state.rollScore;
+                if (currentProjected <= state.winScore) {
+                    const tentativeValues = [...state.selected, globalIdx].map(i => state.dice[i]);
+                    const tentativeScore = evaluate(tentativeValues).score;
+                    const projected = myScore + state.turnTotal + tentativeScore;
+                    if (projected > state.winScore) {
+                        const hasAlternative = state.selected.size > 0 || hasNonOvershootingSubset();
+                        if (hasAlternative) {
+                            showOvershootRejection();
+                            return;
+                        }
+                    }
+                }
+            }
+
             state.selected.add(globalIdx);
         }
 
@@ -1011,6 +1035,33 @@
         renderDice(false);
         updateScores();
         updateButtonStates();
+    }
+
+    // Brute-force search over 2^n subsets of available scoring dice (n ≤ 6 → 64 max).
+    // Returns true iff at least one non-empty subset scores within the remaining headroom.
+    // Used to decide whether the "would-overshoot" click rejection has a viable alternative,
+    // or whether we should let the click through as an escape hatch.
+    function hasNonOvershootingSubset() {
+        const available = state.scoringIndices.filter(i => !state.locked.has(i));
+        const myScore = state.scores[state.currentPlayer] || 0;
+        const headroom = state.winScore - myScore - state.turnTotal;
+        if (headroom <= 0) return false;
+        const n = available.length;
+        for (let mask = 1; mask < (1 << n); mask++) {
+            const subset = [];
+            for (let i = 0; i < n; i++) if (mask & (1 << i)) subset.push(available[i]);
+            const values = subset.map(i => state.dice[i]);
+            const score = evaluate(values).score;
+            if (score > 0 && score <= headroom) return true;
+        }
+        return false;
+    }
+
+    function showOvershootRejection() {
+        if (!els.ruleHint) return;
+        els.ruleHint.textContent = `Can't take that — would overshoot the target. Try a smaller combo.`;
+        clearTimeout(state._overshootMsgTimer);
+        state._overshootMsgTimer = setTimeout(() => { updateRuleHint(); }, 1800);
     }
 
     function updateScores() {
@@ -1380,7 +1431,8 @@
                      <li>If banking would overshoot the target, Bank stays disabled — you have to keep rolling (and risk a bust) until you can land cleanly.</li>
                      <li>The "one more round after threshold" courtesy is skipped: the first player to bank exactly the target wins immediately.</li>
                    </ul>
-                   <p><strong>Example:</strong> need 100 to win. Roll 1-5-X-X-X-X. Selecting just the 1 = 100 = exact win (the unselected 5 is allowed by the exception). Selecting both gives 150 → overshoot → Bank disabled, must reroll.</p>
+                   <p><strong>Click protection:</strong> dice clicks that would push your selection past the target are rejected with a brief warning, so you can't accidentally overshoot. Exception (escape hatch): when every available scoring subset would overshoot, the click goes through — you're committed to keep rolling and risk a bust.</p>
+                   <p><strong>Example:</strong> need 100 to win. Roll 1-5-X-X-X-X. Selecting just the 1 = 100 = exact win (the unselected 5 is allowed by the exception). Trying to also click the 5 is rejected — that would overshoot to 150.</p>
                    <p class="rules-legend">A very different game — late-turn play becomes a puzzle of which subset of dice gets you closest to the target without going over.</p>`,
         },
     };
