@@ -775,6 +775,7 @@
         els.rollBtn.disabled = false;
         els.rollBtn.innerHTML = '<span aria-hidden="true">🎲</span> Roll Dice';
         els.bankBtn.disabled = true;
+        els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank Score';
         updateCurrentPlayer();
         updateScoreBoard();
         updateRuleHint();
@@ -939,11 +940,12 @@
                 updateScores();
                 const canBank = activeRuleset.rules.hotDiceCanBank;
                 els.statusMessage.textContent = canBank
-                    ? '🔥 HOT DICE! Roll fresh 6 or Bank.'
+                    ? '🔥 HOT DICE! Press your luck (roll again) or end your turn (bank). A bust on the next roll wipes your turn.'
                     : '🔥 HOT DICE! You must roll again!';
                 els.statusMessage.className = 'hot-dice';
                 els.rollBtn.disabled = false;
                 els.rollBtn.innerHTML = '<span aria-hidden="true">🔥</span> Roll Hot Dice';
+                els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank & End Turn';
                 els.bankBtn.disabled = !canBank || state.turnTotal === 0;
                 log(`HOT DICE! Turn total: ${state.turnTotal.toLocaleString()}`);
                 return;
@@ -1023,6 +1025,7 @@
         if (state.hotDicePending) {
             els.rollBtn.disabled = false;
             els.rollBtn.innerHTML = '<span aria-hidden="true">🔥</span> Roll Hot Dice';
+            els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank & End Turn';
             const canBank = activeRuleset.rules.hotDiceCanBank;
             // Under exactScoreWin, hot-dice bank is only allowed if the locked total
             // would land my running score exactly on the target.
@@ -1031,6 +1034,7 @@
             updateRuleHint();
             return;
         }
+        els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank Score';
         const projected = state.turnTotal + state.rollScore;
         const finalIfBanked = myScore + projected;
         const hasValidSelection = state.rollScore > 0;
