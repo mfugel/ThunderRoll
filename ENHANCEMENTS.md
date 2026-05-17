@@ -2,28 +2,24 @@
 
 Ideas to implement later. Not promises, not deadlines — just a queue so nothing gets lost.
 
+## Shipped
+
+### Exact-Score Win + Partial Combos (2026-05-17)
+
+Shipped as a setup toggle: **Exact-Score Win — must hit target exactly; partial combos allowed.**
+
+Design decisions made during implementation (the unresolved questions in the original proposal, now answered):
+
+- **Overshoot when banking would exceed the target** — Bank is disabled when projected total > winScore. Player must keep rolling (or bust).
+- **Exception to "forced reroll on partial selection"** — if the current selection lands the projected total *exactly* on the target, Bank is enabled even with scoring dice left unselected. Without this exception many exact wins would be unreachable (e.g. roll 1-5 needing 100, must take just the 1 and bank).
+- **"One last turn" courtesy is skipped** — under exact-score, the first player to hit the target wins immediately. Overshoot is already prevented at bank time, so == is the only way to cross.
+- **Break-in rule interacts independently** — break-in still requires the threshold in a single turn; exact-score doesn't override it.
+- **Roll that would push you over no matter what** — the AI takes the smallest scoring subset to minimize damage, then is forced to keep rolling (Bank stays disabled). Human players see the same overshoot lock and must keep rolling. There's no auto-bust; the bust comes naturally from the forced rerolls.
+
+AI changes: when this rule is on, Thunderbot brute-forces the 2^n subsets of the current roll's scoring dice (n ≤ 6 → 64 max) and picks the highest-scoring subset that doesn't overshoot. Falls back to the smallest scoring subset when every option overshoots.
+
+Rule-hint UI: when exact-score is on, the hint line shows "Need exactly N more to hit X" / "On target — bank to win!" / "Over the target by N — can't bank, must reroll."
+
 ## Rule variations (proposed)
 
-### Exact-Score Win + Partial Combos
-
-A new optional rule variation: **the player must hit the winning score exactly — going over is not allowed.** To make landing on the target possible, no scoring combination is locked as a unit; any subset of a scoring combo can be selected.
-
-**Partial combos.** Examples of what becomes selectable under this rule:
-- A Full House (3+2 or 3+2+1) can be broken up — take just the triple, or just the pair (if 1s/5s), or just one scoring die, etc. The unselected dice stay in play.
-- Straight, Three Pairs, Two Triples — same idea. Partial selection allowed; the remaining dice can be rerolled.
-- Big Multipliers — a 4-of-a-kind worth 800 could be taken as just the three for 400, with the 4th left to reroll.
-
-**Forced reroll on partial selection.** If the player does NOT select every scoring die available on a roll (i.e. leaves points on the table), they **must roll again** — Bank is disabled. Only when the player has taken all scoring dice from the current roll can they bank (subject to all the normal banking rules).
-
-The point of leaving points on the table: to shape the score path so the player can land exactly on the target. The cost: another forced roll, with all the usual bust risk.
-
-**Open design questions** (to resolve when implementing):
-- What happens if banking would put the player over the target? Likely: Bank is disabled when projected total > winScore. Player must keep rolling (or bust). Need to confirm with Mark.
-- What happens if a roll's scoring dice would push them over no matter what they take? Bust, or roll voided?
-- Does this rule interact with the Break-in Score rule? Probably independent.
-- UI cue: surface a "needs exact X more" indicator on the current player's score during the late game.
-
-**Implementation notes** (for future me):
-- The `scoringIndices` set from `evaluate()` currently flags every die that contributes to the max score. Under this rule, partial selection means we have to relax the "selection must form a recognized combo" check — but the current click handler already allows any scoringIndices die to be toggled and rescores via `evaluate(selectedValues)`, which returns 0 for non-scoring subsets. That's most of what's needed.
-- The "must roll if points were left" check happens in `updateButtonStates`: disable Bank when `state.scoringIndices.length > state.selected.size` (or similar — careful with locked-die accounting).
-- Add the toggle alongside the other rule variations, plus a `VARIATION_INFO` entry.
+*(none currently queued)*

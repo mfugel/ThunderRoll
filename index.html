@@ -264,6 +264,10 @@
                 <label><input type="checkbox" id="hotDiceCanBank"> Hot Dice — allow banking instead of forcing reroll</label>
                 <button type="button" class="info-icon" data-info="hotDiceCanBank" title="Click for details" aria-label="More info about Hot Dice banking">i</button>
             </div>
+            <div class="setup-row">
+                <label><input type="checkbox" id="exactScoreWin"> Exact-Score Win — must hit target exactly; partial combos allowed</label>
+                <button type="button" class="info-icon" data-info="exactScoreWin" title="Click for details" aria-label="More info about Exact-Score Win">i</button>
+            </div>
         </div>
         <div id="iconPicker" class="icon-picker" style="display:none"></div>
         <div style="margin-top:14px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
@@ -414,6 +418,7 @@
                 minScoreToGetOnBoard: 0,
                 mustKeepEachRoll: true,
                 hotDiceCanBank: false,  // default: must reroll on hot dice; toggle on to allow banking
+                exactScoreWin: false,   // default: any bank that crosses winScore wins. On: must land exactly on winScore.
             },
         },
         // future variants slot in here — same shape, different numbers
@@ -560,6 +565,7 @@
         triplePenalty: document.getElementById('triplePenalty'),
         straightValue: document.getElementById('straightValue'),
         hotDiceCanBank: document.getElementById('hotDiceCanBank'),
+        exactScoreWin: document.getElementById('exactScoreWin'),
         ruleHint: document.getElementById('ruleHint'),
         winPresets: document.querySelectorAll('.win-preset'),
         iconPicker: document.getElementById('iconPicker'),
@@ -610,6 +616,10 @@
         if (els.hotDiceCanBank && els.hotDiceCanBank.checked) {
             r.rules.hotDiceCanBank = true;
             variants.push('Hot Dice can bank');
+        }
+        if (els.exactScoreWin && els.exactScoreWin.checked) {
+            r.rules.exactScoreWin = true;
+            variants.push('Exact-Score Win');
         }
         r.activeVariants = variants;
         if (variants.length) r.name = `Official + ${variants.join(' + ')}`;
@@ -806,8 +816,12 @@
             return;
         }
 
-        // Pick every scoring die from this roll.
-        const toPick = state.scoringIndices.filter(i => !state.locked.has(i) && !state.selected.has(i));
+        const available = state.scoringIndices.filter(i => !state.locked.has(i) && !state.selected.has(i));
+        // Under exactScoreWin, search subsets so we don't blindly overshoot. Otherwise
+        // keep the existing "grab everything that scores" behavior.
+        const toPick = activeRuleset.rules.exactScoreWin
+            ? aiPickExactSubset(available)
+            : available;
         toPick.forEach((idx, n) => setTimeout(() => onDieClick(idx, true), 350 + n * 250));
         const settleDelay = 500 + toPick.length * 250;
 
@@ -821,12 +835,52 @@
             const minBreakIn = activeRuleset.rules.minScoreToGetOnBoard || 0;
             const needsBreakIn = minBreakIn > 0 && myScore === 0;
 
-            if (aiShouldRoll(diceWillRemain, projectedBank, myScore, winScore, needsBreakIn, minBreakIn)) {
+            let shouldRoll;
+            if (activeRuleset.rules.exactScoreWin) {
+                // Land-on-target → bank to win. Bank-disabled (forced reroll or overshoot) → roll.
+                if (myScore + projectedBank === winScore) shouldRoll = false;
+                else if (els.bankBtn.disabled) shouldRoll = true;
+                else shouldRoll = aiShouldRoll(diceWillRemain, projectedBank, myScore, winScore, needsBreakIn, minBreakIn);
+            } else {
+                shouldRoll = aiShouldRoll(diceWillRemain, projectedBank, myScore, winScore, needsBreakIn, minBreakIn);
+            }
+
+            if (shouldRoll) {
                 setTimeout(aiTakeTurn, 700);
             } else {
                 setTimeout(() => { if (!els.bankBtn.disabled) bankScore(); else aiTakeTurn(); }, 600);
             }
         }, settleDelay);
+    }
+
+    // Brute-force over 2^n subsets of the available scoring indices (n ≤ 6 → 64 max).
+    // Pick the highest-scoring subset that won't overshoot the win target. If every
+    // subset overshoots, return the smallest scoring subset — mustKeepEachRoll forces
+    // us to take something, and the smallest-damage option leaves the most headroom
+    // for the next reroll (which is mandatory at that point).
+    function aiPickExactSubset(available) {
+        const n = available.length;
+        if (n === 0) return [];
+        const myScore = state.scores[state.currentPlayer];
+        const headroom = state.winScore - myScore - state.turnTotal;
+        let bestFit = { score: -1, exact: false, subset: [] };
+        let smallest = { score: Infinity, subset: [] };
+        for (let mask = 1; mask < (1 << n); mask++) {
+            const subset = [];
+            for (let i = 0; i < n; i++) if (mask & (1 << i)) subset.push(available[i]);
+            const values = subset.map(i => state.dice[i]);
+            const score = evaluate(values).score;
+            if (score === 0) continue;
+            if (score < smallest.score) smallest = { score, subset };
+            if (score > headroom) continue;
+            const exact = score === headroom;
+            if ((exact && !bestFit.exact) || (exact === bestFit.exact && score > bestFit.score)) {
+                bestFit = { score, exact, subset };
+            }
+        }
+        if (bestFit.subset.length > 0) return bestFit.subset;
+        // Every scoring subset overshoots — take the smallest to keep moving.
+        return smallest.subset.length > 0 ? smallest.subset : [available[0]];
     }
 
     function aiShouldRoll(diceWillRemain, projectedBank, myScore, winScore, needsBreakIn, minBreakIn) {
@@ -964,32 +1018,68 @@
     }
 
     function updateButtonStates() {
+        const exact = activeRuleset.rules.exactScoreWin;
+        const myScore = state.scores[state.currentPlayer] || 0;
         if (state.hotDicePending) {
             els.rollBtn.disabled = false;
             els.rollBtn.innerHTML = '<span aria-hidden="true">🔥</span> Roll Hot Dice';
             const canBank = activeRuleset.rules.hotDiceCanBank;
-            els.bankBtn.disabled = !canBank || state.turnTotal === 0 || blockedByBreakIn(state.turnTotal);
+            // Under exactScoreWin, hot-dice bank is only allowed if the locked total
+            // would land my running score exactly on the target.
+            const exactBlocks = exact && (myScore + state.turnTotal) !== state.winScore;
+            els.bankBtn.disabled = !canBank || state.turnTotal === 0 || blockedByBreakIn(state.turnTotal) || exactBlocks;
             updateRuleHint();
             return;
         }
         const projected = state.turnTotal + state.rollScore;
+        const finalIfBanked = myScore + projected;
         const hasValidSelection = state.rollScore > 0;
         const hasPointsToBank = projected > 0;
         els.rollBtn.disabled = !hasValidSelection;
-        els.bankBtn.disabled = !hasPointsToBank || blockedByBreakIn(projected);
+        let bankDisabled = !hasPointsToBank || blockedByBreakIn(projected);
+        if (exact && !bankDisabled) {
+            // Overshoot: can never bank past the target.
+            if (finalIfBanked > state.winScore) {
+                bankDisabled = true;
+            } else {
+                // Forced reroll on partial selection: every scoring die in the current roll
+                // must be selected — unless the partial selection lands exactly on the target,
+                // in which case banking is allowed as the only way to actually win cleanly.
+                const scoringTaken = state.scoringIndices.every(i => state.selected.has(i));
+                const isExact = finalIfBanked === state.winScore;
+                if (!scoringTaken && !isExact) bankDisabled = true;
+            }
+        }
+        els.bankBtn.disabled = bankDisabled;
         els.rollBtn.innerHTML = (state.locked.size > 0 || state.selected.size > 0) ? '<span aria-hidden="true">🎲</span> Roll Remaining' : '<span aria-hidden="true">🎲</span> Roll Dice';
         updateRuleHint();
     }
 
     function updateRuleHint() {
         if (!els.ruleHint) return;
+        if (state.gameOver) { els.ruleHint.textContent = ''; return; }
         const min = activeRuleset.rules.minScoreToGetOnBoard || 0;
-        if (min && state.scores[state.currentPlayer] === 0 && !state.gameOver) {
+        if (min && state.scores[state.currentPlayer] === 0) {
             const projected = state.turnTotal + (state.hotDicePending ? 0 : state.rollScore);
             if (projected < min) {
                 els.ruleHint.textContent = `Need ${min.toLocaleString()} to get on the board (have ${projected.toLocaleString()}).`;
                 return;
             }
+        }
+        if (activeRuleset.rules.exactScoreWin) {
+            const myScore = state.scores[state.currentPlayer];
+            const projected = state.turnTotal + (state.hotDicePending ? 0 : state.rollScore);
+            const remaining = state.winScore - myScore - projected;
+            if (remaining > 0) {
+                els.ruleHint.textContent = `Need exactly ${remaining.toLocaleString()} more to hit ${state.winScore.toLocaleString()}.`;
+                return;
+            }
+            if (remaining === 0) {
+                els.ruleHint.textContent = `On target — bank to win!`;
+                return;
+            }
+            els.ruleHint.textContent = `Over the target by ${(-remaining).toLocaleString()} — can't bank, must reroll.`;
+            return;
         }
         els.ruleHint.textContent = '';
     }
@@ -1081,8 +1171,15 @@
         log(`${state.players[state.currentPlayer]} banked ${banked.toLocaleString()} (total: ${state.scores[state.currentPlayer].toLocaleString()})`);
         updateScoreBoard();
 
-        // Threshold-crossing logic
-        if (state.scores[state.currentPlayer] >= state.winScore && !state.finalRound) {
+        // Threshold-crossing logic. Under exactScoreWin, hitting the target exactly
+        // ends the game immediately — no final-round courtesy (overshoot is prevented
+        // at bank time, so == is the only way to cross the threshold in this mode).
+        if (activeRuleset.rules.exactScoreWin) {
+            if (state.scores[state.currentPlayer] === state.winScore) {
+                playWin(); triggerConfetti(); endGame();
+                return;
+            }
+        } else if (state.scores[state.currentPlayer] >= state.winScore && !state.finalRound) {
             if (activeRuleset.rules.oneMoreRoundAfterThreshold) {
                 state.finalRound = true;
                 state.finalRoundTrigger = state.currentPlayer;
@@ -1265,6 +1362,23 @@
                    </ul>
                    <p class="rules-legend">The default is the riskier, more classic Farkle behavior — a hot streak forces another roll, which can wipe you out. Toggle this on for a more forgiving game.</p>`,
         },
+        exactScoreWin: {
+            title: 'Exact-Score Win + Partial Combos',
+            body: `<p>To win, your banked total must <strong>exactly equal</strong> the target — no overshoot allowed. To make landing on the target possible, two things change:</p>
+                   <ul>
+                     <li><strong>Partial combos.</strong> Scoring combos no longer lock as units. You can take any subset of the scoring dice on a roll — three of a four-of-a-kind, one die from a Straight, the triple from a Full House, etc. The dice you leave behind stay in play and get rerolled.</li>
+                     <li><strong>Forced reroll on partial selection.</strong> If you leave any scoring dice unselected, Bank is disabled and you <strong>must roll again</strong> — the cost of leaving points on the table is another roll, with all the usual bust risk.</li>
+                   </ul>
+                   <p><strong>Banking rules under this variant:</strong></p>
+                   <ul>
+                     <li>Bank is enabled only when you've taken every scoring die from the current roll <em>and</em> the projected total ≤ target.</li>
+                     <li>Bank is also enabled (as an exception) if your current selection lands the projected total <em>exactly</em> on the target, even if scoring dice are left unselected — otherwise some exact wins would be unreachable.</li>
+                     <li>If banking would overshoot the target, Bank stays disabled — you have to keep rolling (and risk a bust) until you can land cleanly.</li>
+                     <li>The "one more round after threshold" courtesy is skipped: the first player to bank exactly the target wins immediately.</li>
+                   </ul>
+                   <p><strong>Example:</strong> need 100 to win. Roll 1-5-X-X-X-X. Selecting just the 1 = 100 = exact win (the unselected 5 is allowed by the exception). Selecting both gives 150 → overshoot → Bank disabled, must reroll.</p>
+                   <p class="rules-legend">A very different game — late-turn play becomes a puzzle of which subset of dice gets you closest to the target without going over.</p>`,
+        },
     };
 
     function openVariationInfo(key) {
@@ -1327,7 +1441,9 @@
         lines.push(r.hotDiceCanBank
             ? '<li><strong>HOT DICE</strong>: when all 6 dice score in one turn, you can roll fresh 6 or Bank.</li>'
             : '<li><strong>HOT DICE</strong>: when all 6 dice score in one turn, you <strong>must</strong> roll fresh 6 — banking is disabled until the next roll resolves. (Toggle "Hot Dice — allow banking" in setup to make banking optional.)</li>');
-        if (r.oneMoreRoundAfterThreshold) {
+        if (r.exactScoreWin) {
+            lines.push(`<li><strong>EXACT-SCORE WIN</strong>: you must bank exactly ${state.winScore.toLocaleString()} to win — no overshoot. Partial combos are allowed (take any subset of scoring dice). Leaving scoring dice unselected forces another roll. Bank is enabled only when all scoring dice are taken (or the selection hits the target exactly).</li>`);
+        } else if (r.oneMoreRoundAfterThreshold) {
             lines.push(`<li>When a player crosses the win threshold, every other player gets one last turn — highest score wins.</li>`);
         }
         lines.push('</ul>');
