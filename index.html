@@ -722,7 +722,8 @@
         multiplayerMode = mode;
         if (code) roomCode = code;
         if (mode === 'local') {
-            roomCode = null; isHost = false; roomVersion = 0;
+            roomCode = null; isHost = false; roomVersion = 0; roomCreated = false;
+            stopPolling();
             els.setup.style.display = '';
             els.joinScreen.style.display = 'none';
             els.mpModeLabel.innerHTML = '🏠 <strong>Local game</strong> — everyone shares this device.';
@@ -731,10 +732,12 @@
             els.cancelHostBtn.style.display = 'none';
         } else if (mode === 'host') {
             isHost = true;
+            roomCreated = false;
             els.setup.style.display = '';
             els.joinScreen.style.display = 'none';
-            const shareUrl = buildRoomUrl(roomCode);
-            els.mpModeLabel.innerHTML = `🌐 <strong>Hosting</strong> — share this code: <code style="font-size:1.15em;letter-spacing:.18em;background:rgba(0,0,0,.25);padding:3px 10px;border-radius:4px;margin:0 4px">${roomCode}</code><br><span style="font-size:.85em;opacity:.8">or send the link: ${shareUrl}</span>`;
+            // Code is provisional until Start Game actually creates the room on the server.
+            // Don't promise this code is shareable yet.
+            els.mpModeLabel.innerHTML = `🌐 <strong>Will host as room</strong> <code style="font-size:1.15em;letter-spacing:.18em;background:rgba(0,0,0,.25);padding:3px 10px;border-radius:4px;margin:0 4px">${roomCode}</code> — <em>click Start Game to open the room, then share the code.</em>`;
             els.hostRoomBtn.style.display = 'none';
             els.joinRoomBtn.style.display = 'none';
             els.cancelHostBtn.style.display = '';
@@ -756,6 +759,13 @@
     let pushQueue = Promise.resolve();
     function pushState() {
         if (multiplayerMode === 'local' || !roomCode) return Promise.resolve();
+        // Critical: don't push until createRoom/joinRoom has completed. Otherwise the
+        // first nextTurn's push races with createRoom's create POST and the room
+        // ends up with an indeterminate state (often nothing at the shared code).
+        if (!roomCreated) {
+            console.log('[mp] pushState skipped — room not yet created');
+            return Promise.resolve();
+        }
         pushQueue = pushQueue.catch(() => {}).then(async () => {
             const res = await roomApi.post(roomCode, {
                 expectedVersion: roomVersion,
@@ -852,28 +862,63 @@
         els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank Score';
     }
 
+    let roomCreated = false;  // gates pushState so it doesn't race createRoom
+
+    function setHostBannerCreating() {
+        els.mpModeLabel.innerHTML = `🌐 <strong>Opening room…</strong> <span style="font-size:.85em;opacity:.8">(creating on the server)</span>`;
+    }
+    function setHostBannerReady(code) {
+        const shareUrl = buildRoomUrl(code);
+        els.mpModeLabel.innerHTML = `🌐 <strong>Room open</strong> — share this code: <code style="font-size:1.2em;letter-spacing:.18em;background:rgba(0,0,0,.3);padding:3px 12px;border-radius:4px;margin:0 4px">${code}</code><br><span style="font-size:.85em;opacity:.85">or send this link: <a href="${shareUrl}" style="color:inherit;text-decoration:underline">${shareUrl}</a></span>`;
+    }
+    function setHostBannerError(status, msg) {
+        els.mpModeLabel.innerHTML = `❌ <strong>Could not open room</strong> (${status}). ${msg || ''}<br><span style="font-size:.85em;opacity:.85">Playing locally instead.</span>`;
+    }
+
     async function createRoom() {
-        const res = await roomApi.post(roomCode, {
-            expectedVersion: 0,
-            host: state.players[0],
-            ruleset: activeRuleset?.name || 'official',
-            state: serializeStateForWire(state),
-        });
-        if (res.status === 409) {
-            // Code collision — extraordinarily rare with 64M combos but possible. Regen + retry.
-            roomCode = generateRoomCode();
-            return createRoom();
-        }
-        if (res.status !== 200) {
-            log(`⚠️ Could not open room (${res.status}). Falling back to local play.`);
+        setHostBannerCreating();
+        let attempts = 0;
+        while (attempts++ < 5) {
+            console.log(`[mp] createRoom attempt ${attempts} → code=${roomCode}`);
+            let res;
+            try {
+                res = await roomApi.post(roomCode, {
+                    expectedVersion: 0,
+                    host: state.players[0],
+                    ruleset: activeRuleset?.name || 'official',
+                    state: serializeStateForWire(state),
+                });
+            } catch (e) {
+                console.error('[mp] createRoom network error', e);
+                setHostBannerError('network', 'Check your connection and reload.');
+                multiplayerMode = 'local';
+                log('⚠️ Could not open room — network error. Playing locally.');
+                return false;
+            }
+            console.log(`[mp] createRoom response: ${res.status}`, res.body);
+            if (res.status === 200) {
+                roomVersion = res.body.version;
+                myPlayerName = state.players[0];
+                roomCreated = true;
+                history.replaceState({}, '', `${location.pathname}?room=${roomCode}`);
+                setHostBannerReady(roomCode);
+                log(`🌐 Room ${roomCode} opened — share the code or send ${buildRoomUrl(roomCode)}`);
+                startPolling();
+                return true;
+            }
+            if (res.status === 409) {
+                roomCode = generateRoomCode();
+                console.warn(`[mp] code collision, retrying with ${roomCode}`);
+                continue;
+            }
+            setHostBannerError(res.status, res.body?.error || 'Unknown server error.');
+            log(`⚠️ Could not open room (${res.status}: ${res.body?.error || 'unknown'}). Playing locally.`);
             multiplayerMode = 'local';
-            return;
+            return false;
         }
-        roomVersion = res.body.version;
-        myPlayerName = state.players[0];
-        history.replaceState({}, '', `${location.pathname}?room=${roomCode}`);
-        log(`🌐 Room ${roomCode} opened — share the code or send ${buildRoomUrl(roomCode)}`);
-        startPolling();
+        setHostBannerError('retries', 'Too many code collisions.');
+        multiplayerMode = 'local';
+        return false;
     }
 
     async function joinRoom() {
@@ -897,6 +942,7 @@
         roomVersion = room.version;
         isHost = false;
         multiplayerMode = 'join';
+        roomCreated = true;  // joiner's pushes are now allowed
         applyStateFromWire(room.state);
         myPlayerName = state.players[slotIdx];  // canonical casing from host
         history.replaceState({}, '', `${location.pathname}?room=${code}`);
