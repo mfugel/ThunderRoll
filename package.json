@@ -1,0 +1,9 @@
+{
+  "name": "thunderoll",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Thunderoll multiplayer dice game — serverless functions",
+  "dependencies": {
+    "@upstash/redis": "^1.34.3"
+  }
+}
