@@ -196,6 +196,12 @@
     </div>
     <div id="setup" class="setup">
         <h2>Game Setup</h2>
+        <div id="multiplayerBanner" style="text-align:center;padding:10px 14px;margin-bottom:14px;background:var(--panel-bg);border:1px solid var(--panel-border);border-radius:8px;font-size:.95em">
+            <div id="mpModeLabel" style="margin-bottom:8px">🏠 <strong>Local game</strong> — everyone shares this device.</div>
+            <button id="hostRoomBtn" type="button" style="padding:6px 14px;margin:0 4px">🌐 Host a Remote Game</button>
+            <button id="joinRoomBtn" type="button" style="padding:6px 14px;margin:0 4px">🔗 Join with Code</button>
+            <button id="cancelHostBtn" type="button" style="display:none;padding:6px 14px;margin:0 4px">← Back to Local</button>
+        </div>
         <div class="setup-row theme-row">
             <label for="themePicker">Theme:</label>
             <select id="themePicker">
@@ -273,6 +279,19 @@
         <div style="margin-top:14px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
             <button id="startGame" style="background:#2ecc71;font-size:1.1em;padding:12px 26px">Start Game</button>
             <button id="setupRulesBtn" class="rules-btn" style="font-size:.95em;padding:12px 22px">📖 Scoring Rules</button>
+        </div>
+    </div>
+    <div id="joinScreen" class="setup" style="display:none">
+        <h2>Join a Remote Game</h2>
+        <p style="text-align:center;opacity:.85;margin:8px 0 16px">Enter the 6-letter code the host shared with you.</p>
+        <div class="setup-row" style="justify-content:center;flex-wrap:wrap;gap:14px">
+            <span><label for="joinCodeInput" style="font-size:1.05em;margin-right:6px">Room code:</label><input type="text" id="joinCodeInput" maxlength="6" autocomplete="off" autocapitalize="characters" style="font-size:1.4em;letter-spacing:0.2em;text-transform:uppercase;width:9ch;text-align:center;padding:6px 10px"></span>
+            <span><label for="joinNameInput" style="font-size:1.05em;margin-right:6px">Your name:</label><input type="text" id="joinNameInput" placeholder="Your name" style="padding:6px 10px;width:14ch"></span>
+        </div>
+        <div id="joinStatus" style="text-align:center;min-height:1.4em;margin:14px 0;opacity:.9"></div>
+        <div style="margin-top:14px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
+            <button id="joinSubmitBtn" style="background:#2ecc71;font-size:1.1em;padding:12px 26px">Join Game</button>
+            <button id="joinCancelBtn" style="font-size:.95em;padding:12px 22px">← Back to Local</button>
         </div>
     </div>
     <div id="game" style="display:none">
@@ -529,6 +548,17 @@
     const els = {
         setup: document.getElementById('setup'),
         game: document.getElementById('game'),
+        joinScreen: document.getElementById('joinScreen'),
+        multiplayerBanner: document.getElementById('multiplayerBanner'),
+        mpModeLabel: document.getElementById('mpModeLabel'),
+        hostRoomBtn: document.getElementById('hostRoomBtn'),
+        joinRoomBtn: document.getElementById('joinRoomBtn'),
+        cancelHostBtn: document.getElementById('cancelHostBtn'),
+        joinCodeInput: document.getElementById('joinCodeInput'),
+        joinNameInput: document.getElementById('joinNameInput'),
+        joinStatus: document.getElementById('joinStatus'),
+        joinSubmitBtn: document.getElementById('joinSubmitBtn'),
+        joinCancelBtn: document.getElementById('joinCancelBtn'),
         winScore: document.getElementById('winScore'),
         targetScore: document.getElementById('targetScore'),
         addPlayer: document.getElementById('addPlayer'),
@@ -626,7 +656,118 @@
         activeRuleset = r;
     }
 
+    // ─── Multiplayer (v1.0 scaffolding) ──────────────────────────────────
+    // Phase 1: UI scaffolding + URL parse + helpers. Buttons are wired but the
+    // full host/join game flow + sync loop ship in the next commits.
+    const ROOM_CODE_RE = /^[A-Z]{6}$/;
+    const ROOM_CODE_ALPHABET = 'BCDFGHJKLMNPQRSTVWXYZ'; // no vowels, no I/O — fewer misreads when reading codes aloud
+    let multiplayerMode = 'local'; // 'local' | 'host' | 'join'
+    let roomCode = null;
+    let roomVersion = 0;
+    let isHost = false;
+    let myPlayerName = null;
+    let pollHandle = null;
+
+    function generateRoomCode() {
+        let s = '';
+        for (let i = 0; i < 6; i++) s += ROOM_CODE_ALPHABET[Math.floor(Math.random() * ROOM_CODE_ALPHABET.length)];
+        return s;
+    }
+    function parseRoomFromUrl() {
+        const c = (new URLSearchParams(location.search).get('room') || '').toUpperCase().trim();
+        return ROOM_CODE_RE.test(c) ? c : null;
+    }
+    function buildRoomUrl(code) {
+        return `${location.origin}${location.pathname}?room=${code}`;
+    }
+    // Convert state object to a JSON-safe wire payload (Sets → arrays).
+    function serializeStateForWire(s) {
+        return {
+            players: s.players, icons: s.icons, isAI: s.isAI, scores: s.scores, farkleStreak: s.farkleStreak,
+            aiPlaying: s.aiPlaying, currentPlayer: s.currentPlayer,
+            turnTotal: s.turnTotal, rollScore: s.rollScore,
+            dice: [...s.dice],
+            locked: [...s.locked], selected: [...s.selected], scoringIndices: [...s.scoringIndices],
+            rolling: s.rolling, hotDicePending: s.hotDicePending,
+            winScore: s.winScore,
+            finalRound: s.finalRound, finalRoundTrigger: s.finalRoundTrigger,
+            gameOver: s.gameOver,
+        };
+    }
+    // Apply a wire payload onto the live state object (arrays → Sets).
+    function applyStateFromWire(w) {
+        Object.assign(state, w);
+        state.locked = new Set(w.locked || []);
+        state.selected = new Set(w.selected || []);
+        state.scoringIndices = Array.isArray(w.scoringIndices) ? w.scoringIndices : [];
+    }
+    const roomApi = {
+        get: async (code) => {
+            const r = await fetch(`/api/room?code=${code}`, { cache: 'no-store' });
+            if (r.status === 404) return null;
+            if (!r.ok) throw new Error(`GET /api/room ${r.status}`);
+            return r.json();
+        },
+        post: async (code, body) => {
+            const r = await fetch(`/api/room?code=${code}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const j = await r.json().catch(() => ({}));
+            return { status: r.status, body: j };
+        },
+    };
+    function setMultiplayerMode(mode, code) {
+        multiplayerMode = mode;
+        if (code) roomCode = code;
+        if (mode === 'local') {
+            roomCode = null; isHost = false; roomVersion = 0;
+            els.setup.style.display = '';
+            els.joinScreen.style.display = 'none';
+            els.mpModeLabel.innerHTML = '🏠 <strong>Local game</strong> — everyone shares this device.';
+            els.hostRoomBtn.style.display = '';
+            els.joinRoomBtn.style.display = '';
+            els.cancelHostBtn.style.display = 'none';
+        } else if (mode === 'host') {
+            isHost = true;
+            els.setup.style.display = '';
+            els.joinScreen.style.display = 'none';
+            const shareUrl = buildRoomUrl(roomCode);
+            els.mpModeLabel.innerHTML = `🌐 <strong>Hosting</strong> — share this code: <code style="font-size:1.15em;letter-spacing:.18em;background:rgba(0,0,0,.25);padding:3px 10px;border-radius:4px;margin:0 4px">${roomCode}</code><br><span style="font-size:.85em;opacity:.8">or send the link: ${shareUrl}</span>`;
+            els.hostRoomBtn.style.display = 'none';
+            els.joinRoomBtn.style.display = 'none';
+            els.cancelHostBtn.style.display = '';
+        } else if (mode === 'join') {
+            els.setup.style.display = 'none';
+            els.joinScreen.style.display = '';
+            if (roomCode && els.joinCodeInput) els.joinCodeInput.value = roomCode;
+        }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
+        // Multiplayer scaffolding wire-up (full create/join flow ships next commit).
+        const urlRoom = parseRoomFromUrl();
+        if (urlRoom) {
+            setMultiplayerMode('join', urlRoom);
+        } else {
+            setMultiplayerMode('local');
+        }
+        els.hostRoomBtn.onclick = () => {
+            roomCode = generateRoomCode();
+            setMultiplayerMode('host');
+        };
+        els.joinRoomBtn.onclick = () => setMultiplayerMode('join');
+        els.cancelHostBtn.onclick = () => setMultiplayerMode('local');
+        els.joinCancelBtn.onclick = () => {
+            // Strip ?room= from URL when bailing out, so reload doesn't bounce back here.
+            if (location.search) history.replaceState({}, '', location.pathname);
+            setMultiplayerMode('local');
+        };
+        els.joinSubmitBtn.onclick = () => {
+            els.joinStatus.textContent = 'Join flow ships in the next commit — UI scaffolding only.';
+        };
+
         els.addPlayer.onclick = () => {
             if (els.playerList.children.length >= 6) return alert('Max 6 players');
             const idx = els.playerList.children.length;
