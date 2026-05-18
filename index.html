@@ -855,16 +855,18 @@
     }
 
     // Brute-force over 2^n subsets of the available scoring indices (n ≤ 6 → 64 max).
-    // Pick the highest-scoring subset that won't overshoot the win target. If every
-    // subset overshoots, return the smallest scoring subset — mustKeepEachRoll forces
-    // us to take something, and the smallest-damage option leaves the most headroom
-    // for the next reroll (which is mandatory at that point).
+    // Picks the highest-scoring subset that doesn't overshoot. Under the strict
+    // exactScoreWin rule, banking requires taking ALL scoring dice — so a partial
+    // subset can never win the turn, only set up a hopeful reroll. Maximizing score
+    // (without overshoot) keeps the most "exact" combinations on the locked side.
+    // Fallback: if every subset overshoots, onRollClick should have already auto-busted
+    // the roll, so this branch is defensive — return the smallest scoring subset.
     function aiPickExactSubset(available) {
         const n = available.length;
         if (n === 0) return [];
         const myScore = state.scores[state.currentPlayer];
         const headroom = state.winScore - myScore - state.turnTotal;
-        let bestFit = { score: -1, exact: false, subset: [] };
+        let bestFit = { score: -1, subset: [] };
         let smallest = { score: Infinity, subset: [] };
         for (let mask = 1; mask < (1 << n); mask++) {
             const subset = [];
@@ -874,13 +876,9 @@
             if (score === 0) continue;
             if (score < smallest.score) smallest = { score, subset };
             if (score > headroom) continue;
-            const exact = score === headroom;
-            if ((exact && !bestFit.exact) || (exact === bestFit.exact && score > bestFit.score)) {
-                bestFit = { score, exact, subset };
-            }
+            if (score > bestFit.score) bestFit = { score, subset };
         }
         if (bestFit.subset.length > 0) return bestFit.subset;
-        // Every scoring subset overshoots — take the smallest to keep moving.
         return smallest.subset.length > 0 ? smallest.subset : [available[0]];
     }
 
@@ -1096,12 +1094,12 @@
             if (finalIfBanked > state.winScore) {
                 bankDisabled = true;
             } else {
-                // Forced reroll on partial selection: every scoring die in the current roll
-                // must be selected — unless the partial selection lands exactly on the target,
-                // in which case banking is allowed as the only way to actually win cleanly.
+                // Forced reroll on partial selection — every scoring die in the current roll
+                // must be selected before banking. No exception for hitting target via partial:
+                // the only way to win is to roll dice whose scoring total equals the headroom
+                // exactly, take all of them, and bank.
                 const scoringTaken = state.scoringIndices.every(i => state.selected.has(i));
-                const isExact = finalIfBanked === state.winScore;
-                if (!scoringTaken && !isExact) bankDisabled = true;
+                if (!scoringTaken) bankDisabled = true;
             }
         }
         els.bankBtn.disabled = bankDisabled;
@@ -1124,12 +1122,17 @@
             const myScore = state.scores[state.currentPlayer];
             const projected = state.turnTotal + (state.hotDicePending ? 0 : state.rollScore);
             const remaining = state.winScore - myScore - projected;
+            const scoringLeftOnTable = !state.hotDicePending
+                && state.scoringIndices.length > 0
+                && !state.scoringIndices.every(i => state.selected.has(i));
             if (remaining > 0) {
                 els.ruleHint.textContent = `Need exactly ${remaining.toLocaleString()} more to hit ${state.winScore.toLocaleString()}.`;
                 return;
             }
             if (remaining === 0) {
-                els.ruleHint.textContent = `On target — bank to win!`;
+                els.ruleHint.textContent = scoringLeftOnTable
+                    ? `On target — but scoring dice are still on the table, so you must roll again. Bust risk.`
+                    : `On target — bank to win!`;
                 return;
             }
             els.ruleHint.textContent = `Over the target by ${(-remaining).toLocaleString()} — can't bank, must reroll.`;
@@ -1429,15 +1432,17 @@
                      <li><strong>Partial combos.</strong> Scoring combos no longer lock as units. You can take any subset of the scoring dice on a roll — three of a four-of-a-kind, one die from a Straight, the triple from a Full House, etc. The dice you leave behind stay in play and get rerolled.</li>
                      <li><strong>Forced reroll on partial selection.</strong> If you leave any scoring dice unselected, Bank is disabled and you <strong>must roll again</strong> — the cost of leaving points on the table is another roll, with all the usual bust risk.</li>
                    </ul>
-                   <p><strong>Banking rules under this variant:</strong></p>
+                   <p><strong>Banking rules under this variant — strict:</strong></p>
                    <ul>
-                     <li>Bank is enabled only when you've taken every scoring die from the current roll <em>and</em> the projected total ≤ target.</li>
-                     <li>Bank is also enabled (as an exception) if your current selection lands the projected total <em>exactly</em> on the target, even if scoring dice are left unselected — otherwise some exact wins would be unreachable.</li>
+                     <li>Bank is enabled <em>only</em> when you've taken every scoring die from the current roll <em>and</em> the projected total ≤ target. <strong>No exceptions.</strong> If any scoring die is unselected, you must roll again.</li>
+                     <li>This means: even if your selection happens to land the projected total exactly on the target, you still cannot bank as long as scoring dice are left on the table — you must roll, which sometimes busts.</li>
                      <li>If banking would overshoot the target, Bank stays disabled — you have to keep rolling (and risk a bust) until you can land cleanly.</li>
                      <li>The "one more round after threshold" courtesy is skipped: the first player to bank exactly the target wins immediately.</li>
+                     <li><strong>Auto-bust:</strong> if every scoring subset on the current roll would overshoot the target, the roll is treated as a BUST immediately.</li>
                    </ul>
-                   <p><strong>Click protection:</strong> dice clicks that would push your selection past the target are rejected with a brief warning, so you can't accidentally overshoot. Exception (escape hatch): when every available scoring subset would overshoot, the click goes through — you're committed to keep rolling and risk a bust.</p>
-                   <p><strong>Example:</strong> need 100 to win. Roll 1-5-X-X-X-X. Selecting just the 1 = 100 = exact win (the unselected 5 is allowed by the exception). Trying to also click the 5 is rejected — that would overshoot to 150.</p>
+                   <p><strong>To actually win, then:</strong> you need a roll where the scoring dice add up to exactly the points you still need (with any non-scoring dice alongside). Take all the scoring dice, bank, and the game ends.</p>
+                   <p><strong>Click protection:</strong> dice clicks that would push your selection past the target are rejected with a brief warning, so you can't accidentally overshoot.</p>
+                   <p><strong>Example:</strong> need 100 to win. Roll 1-5-X-X-X-X. The 1 and 5 are both scoring. You must take both = 150 → overshoots → can't bank this roll. To win, you'd need a roll like 1-X-X-X-X-X (only the 1 scores, take it = 100 = exact, no leftover, bank to win).</p>
                    <p class="rules-legend">A very different game — late-turn play becomes a puzzle of which subset of dice gets you closest to the target without going over.</p>`,
         },
     };

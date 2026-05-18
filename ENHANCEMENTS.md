@@ -11,10 +11,11 @@ Shipped as a setup toggle: **Exact-Score Win — must hit target exactly; partia
 Design decisions made during implementation (the unresolved questions in the original proposal, now answered):
 
 - **Overshoot when banking would exceed the target** — Bank is disabled when projected total > winScore. Player must keep rolling (or bust).
-- **Exception to "forced reroll on partial selection"** — if the current selection lands the projected total *exactly* on the target, Bank is enabled even with scoring dice left unselected. Without this exception many exact wins would be unreachable (e.g. roll 1-5 needing 100, must take just the 1 and bank).
+- **Forced reroll on partial selection is strict — no exception.** If any scoring die is unselected, Bank is disabled. Even if the current selection happens to project to the exact target, the player must still roll the leftover scoring dice (which sometimes busts the turn). The only path to winning is to roll dice whose scoring total equals the headroom exactly, take all of them, and bank. *(Earlier shipping had a "partial selection lands on target" exception; removed per Mark's direction — the strict version is the intended rule.)*
 - **"One last turn" courtesy is skipped** — under exact-score, the first player to hit the target wins immediately. Overshoot is already prevented at bank time, so == is the only way to cross.
 - **Break-in rule interacts independently** — break-in still requires the threshold in a single turn; exact-score doesn't override it.
-- **Roll that would push you over no matter what** — the AI takes the smallest scoring subset to minimize damage, then is forced to keep rolling (Bank stays disabled). Human players see the same overshoot lock and must keep rolling. There's no auto-bust; the bust comes naturally from the forced rerolls.
+- **Roll that would push you over no matter what** — auto-busted. After a roll resolves, if no scoring subset fits within the headroom, the roll is treated as a BUST (with a distinct "Every combo would overshoot the target" message and "OVERSHOOT BUST" subtitle). Avoids forcing the player into a guaranteed-loss reroll loop.
+- **Click protection** — clicks that would push the current selection past the target are silently rejected with a brief "Can't take that — would overshoot" hint; the player can't accidentally lock themselves out via the UI.
 
 AI changes: when this rule is on, Thunderbot brute-forces the 2^n subsets of the current roll's scoring dice (n ≤ 6 → 64 max) and picks the highest-scoring subset that doesn't overshoot. Falls back to the smallest scoring subset when every option overshoots.
 
