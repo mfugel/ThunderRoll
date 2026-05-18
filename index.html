@@ -745,6 +745,177 @@
         }
     }
 
+    // ─── Multiplayer sync (create/join + push/poll) ──────────────────────
+    function isMyTurn() {
+        if (multiplayerMode === 'local') return true;
+        if (state.gameOver) return false;
+        if (state.isAI[state.currentPlayer]) return isHost; // host drives all bots
+        return state.players[state.currentPlayer] === myPlayerName;
+    }
+
+    let pushQueue = Promise.resolve();
+    function pushState() {
+        if (multiplayerMode === 'local' || !roomCode) return Promise.resolve();
+        pushQueue = pushQueue.catch(() => {}).then(async () => {
+            const res = await roomApi.post(roomCode, {
+                expectedVersion: roomVersion,
+                state: serializeStateForWire(state),
+            });
+            if (res.status === 200) {
+                roomVersion = res.body.version;
+            } else if (res.status === 409) {
+                const fresh = await roomApi.get(roomCode);
+                if (fresh) {
+                    const prev = { currentPlayer: state.currentPlayer };
+                    roomVersion = fresh.version;
+                    applyStateFromWire(fresh.state);
+                    renderFromPulledState(prev);
+                }
+            } else {
+                console.error('pushState failed', res);
+            }
+        });
+        return pushQueue;
+    }
+
+    async function pollOnce() {
+        if (multiplayerMode === 'local' || !roomCode) return;
+        try {
+            const r = await roomApi.get(roomCode);
+            if (!r || r.version <= roomVersion) return;
+            const prev = { currentPlayer: state.currentPlayer, gameOver: state.gameOver };
+            roomVersion = r.version;
+            applyStateFromWire(r.state);
+            renderFromPulledState(prev);
+        } catch (e) {
+            console.warn('poll error', e);
+        }
+    }
+    function startPolling() {
+        if (pollHandle) return;
+        pollHandle = setInterval(pollOnce, 2500);
+    }
+    function stopPolling() {
+        if (pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+    }
+
+    function renderFromPulledState(prev) {
+        const wasMyTurn = prev && (state.players[prev.currentPlayer] === myPlayerName
+            || (isHost && state.isAI[prev.currentPlayer]));
+        const isMine = isMyTurn();
+
+        if (!wasMyTurn && isMine && !state.gameOver) {
+            // My turn just started — apply fresh-turn UI (canonical state was already pulled,
+            // but turn-start UI cleanup still needs to happen on this client).
+            applyFreshTurnUI();
+        }
+
+        // Always re-render the visible game elements from canonical state.
+        renderDice(false);
+        updateCurrentPlayer();
+        updateScoreBoard();
+        updateRuleHint();
+        updateScores();
+        updateButtonStates();
+
+        if (state.gameOver && (!prev || !prev.gameOver)) {
+            // Spectator path — winner banner without confetti/sound (host who acted already saw those).
+            els.rollBtn.disabled = true;
+            els.bankBtn.disabled = true;
+            const winnerIdx = state.scores.indexOf(Math.max(...state.scores));
+            const icon = state.icons[winnerIdx] || '🏆';
+            els.statusMessage.textContent = `🏆 ${icon} ${state.players[winnerIdx]} wins with ${state.scores[winnerIdx].toLocaleString()}!`;
+            els.statusMessage.className = 'win';
+        }
+
+        // If a bot's turn just landed and I'm the host, kick off the bot loop.
+        if (isHost && state.isAI[state.currentPlayer] && !state.aiPlaying && !state.gameOver) {
+            state.aiPlaying = true;
+            setTimeout(aiTakeTurn, 1100);
+        }
+    }
+
+    function applyFreshTurnUI() {
+        els.diceContainer.innerHTML = '';
+        els.bankContainer.innerHTML = '';
+        els.bankArea.classList.remove('has-dice');
+        els.turnScore.textContent = '0';
+        els.selectedScore.textContent = 'Selected Points: 0';
+        els.rollScore.textContent = '';
+        els.statusMessage.textContent = '';
+        els.statusMessage.className = '';
+        els.statusMessage.style.color = '';
+        els.statusMessage.style.fontSize = '';
+        els.rollBtn.disabled = false;
+        els.rollBtn.innerHTML = '<span aria-hidden="true">🎲</span> Roll Dice';
+        els.bankBtn.disabled = true;
+        els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank Score';
+    }
+
+    async function createRoom() {
+        const res = await roomApi.post(roomCode, {
+            expectedVersion: 0,
+            host: state.players[0],
+            ruleset: activeRuleset?.name || 'official',
+            state: serializeStateForWire(state),
+        });
+        if (res.status === 409) {
+            // Code collision — extraordinarily rare with 64M combos but possible. Regen + retry.
+            roomCode = generateRoomCode();
+            return createRoom();
+        }
+        if (res.status !== 200) {
+            log(`⚠️ Could not open room (${res.status}). Falling back to local play.`);
+            multiplayerMode = 'local';
+            return;
+        }
+        roomVersion = res.body.version;
+        myPlayerName = state.players[0];
+        history.replaceState({}, '', `${location.pathname}?room=${roomCode}`);
+        log(`🌐 Room ${roomCode} opened — share the code or send ${buildRoomUrl(roomCode)}`);
+        startPolling();
+    }
+
+    async function joinRoom() {
+        const code = (els.joinCodeInput.value || '').toUpperCase().trim();
+        const name = (els.joinNameInput.value || '').trim();
+        if (!ROOM_CODE_RE.test(code)) { els.joinStatus.textContent = '❌ Code must be 6 uppercase letters.'; return; }
+        if (!name) { els.joinStatus.textContent = '❌ Enter your name.'; return; }
+        els.joinStatus.textContent = '⏳ Joining…';
+        let room;
+        try { room = await roomApi.get(code); }
+        catch (e) { els.joinStatus.textContent = '❌ Network error. Try again.'; return; }
+        if (!room) { els.joinStatus.textContent = `❌ No room with code ${code}.`; return; }
+
+        const slotIdx = room.state.players.findIndex(p => p.toLowerCase() === name.toLowerCase());
+        if (slotIdx < 0) {
+            els.joinStatus.textContent = `❌ "${name}" isn't a player in this game. Players: ${room.state.players.join(', ')}.`;
+            return;
+        }
+
+        roomCode = code;
+        roomVersion = room.version;
+        isHost = false;
+        multiplayerMode = 'join';
+        applyStateFromWire(room.state);
+        myPlayerName = state.players[slotIdx];  // canonical casing from host
+        history.replaceState({}, '', `${location.pathname}?room=${code}`);
+
+        // Switch to game screen.
+        els.setup.style.display = 'none';
+        els.joinScreen.style.display = 'none';
+        els.game.style.display = 'block';
+        els.targetScore.innerHTML = `First to <strong>${state.winScore.toLocaleString()}</strong> wins! <span class="rules-legend">(remote game · you are ${myPlayerName})</span>`;
+        renderDice(false);
+        updateCurrentPlayer();
+        updateScoreBoard();
+        updateRuleHint();
+        updateScores();
+        updateButtonStates();
+        log(`🌐 Joined room ${code} as ${myPlayerName}.`);
+        startPolling();
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
         // Multiplayer scaffolding wire-up (full create/join flow ships next commit).
         const urlRoom = parseRoomFromUrl();
@@ -764,9 +935,7 @@
             if (location.search) history.replaceState({}, '', location.pathname);
             setMultiplayerMode('local');
         };
-        els.joinSubmitBtn.onclick = () => {
-            els.joinStatus.textContent = 'Join flow ships in the next commit — UI scaffolding only.';
-        };
+        els.joinSubmitBtn.onclick = joinRoom;
 
         els.addPlayer.onclick = () => {
             if (els.playerList.children.length >= 6) return alert('Max 6 players');
@@ -780,8 +949,16 @@
             refreshSoloNotice();
         };
         els.startGame.onclick = startGame;
-        els.rollBtn.onclick = () => { if (!state.aiPlaying) onRollClick(); };
-        els.bankBtn.onclick = () => { if (!state.aiPlaying) bankScore(); };
+        els.rollBtn.onclick = () => {
+            if (state.aiPlaying) return;
+            if (multiplayerMode !== 'local' && !isMyTurn()) return;
+            onRollClick();
+        };
+        els.bankBtn.onclick = () => {
+            if (state.aiPlaying) return;
+            if (multiplayerMode !== 'local' && !isMyTurn()) return;
+            bankScore();
+        };
         els.newGameBtn.onclick = () => confirm('New game?') && location.reload();
         els.soundBtn.onclick = () => {
             soundEnabled = !soundEnabled;
@@ -866,7 +1043,8 @@
         if (!names.length) return alert('Add at least one player');
         const isAI = names.map(() => false);
         // Single-player → auto-add the Thunderbot as the opponent.
-        if (names.length === 1) {
+        // Suppress in remote-host mode — the whole point of hosting is real players joining.
+        if (names.length === 1 && multiplayerMode !== 'host') {
             names.push('Thunderbot');
             icons.push('🤖');
             isAI.push(true);
@@ -887,6 +1065,11 @@
         els.game.style.display = 'block';
         log(`Game started — ${activeRuleset.name} rules — first to ${state.winScore.toLocaleString()}`);
         nextTurn();
+        if (multiplayerMode === 'host') {
+            // Create the remote room AFTER nextTurn so the initial state we push is the
+            // first player's fresh-turn state (not the pre-game blank).
+            createRoom();
+        }
     }
 
     function nextTurn() {
@@ -922,13 +1105,20 @@
         updateRuleHint();
         log(`${state.players[state.currentPlayer]}'s turn${state.finalRound ? ' (final round)' : ''}`);
         if (state.isAI[state.currentPlayer]) {
-            state.aiPlaying = true;
-            els.statusMessage.textContent = '🤖 Thunderbot is thinking…';
-            els.statusMessage.className = '';
-            setTimeout(aiTakeTurn, 1100);
+            // In remote games, only the host drives bots; joiners just watch via poll.
+            if (multiplayerMode !== 'local' && !isHost) {
+                state.aiPlaying = true;
+                els.statusMessage.textContent = '🤖 Thunderbot is thinking…';
+            } else {
+                state.aiPlaying = true;
+                els.statusMessage.textContent = '🤖 Thunderbot is thinking…';
+                els.statusMessage.className = '';
+                setTimeout(aiTakeTurn, 1100);
+            }
         } else {
             state.aiPlaying = false;
         }
+        pushState();
     }
 
     // ============================================================
@@ -1087,6 +1277,7 @@
                 els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank & End Turn';
                 els.bankBtn.disabled = !canBank || state.turnTotal === 0;
                 log(`HOT DICE! Turn total: ${state.turnTotal.toLocaleString()}`);
+                pushState();
                 return;
             }
         }
@@ -1135,12 +1326,14 @@
             }
 
             updateButtonStates();
+            pushState();
         }, 900);
     }
 
     // Click a die — toggle selection. Only scoring dice in the current roll can be selected.
     function onDieClick(globalIdx, fromAI = false) {
         if (state.aiPlaying && !fromAI) return;  // user can't touch dice while bot plays
+        if (multiplayerMode !== 'local' && !isMyTurn() && !fromAI) return;  // joiners can't touch active player's dice
         if (state.rolling || state.hotDicePending || state.gameOver) return;
         if (state.locked.has(globalIdx)) return;  // locked dice are inert
 
@@ -1173,6 +1366,7 @@
         renderDice(false);
         updateScores();
         updateButtonStates();
+        pushState();
     }
 
     // Brute-force search over 2^n subsets of available scoring dice (n ≤ 6 → 64 max).
@@ -1314,6 +1508,7 @@
 
         log(msg);
         updateScoreBoard();
+        pushState();
 
         setTimeout(() => {
             state.currentPlayer = (state.currentPlayer + 1) % state.players.length;
@@ -1374,6 +1569,7 @@
         state.scores[state.currentPlayer] += banked;
         log(`${state.players[state.currentPlayer]} banked ${banked.toLocaleString()} (total: ${state.scores[state.currentPlayer].toLocaleString()})`);
         updateScoreBoard();
+        pushState();
 
         // Threshold-crossing logic. Under exactScoreWin, hitting the target exactly
         // ends the game immediately — no final-round courtesy (overshoot is prevented
@@ -1413,6 +1609,7 @@
         triggerConfetti();
         triggerWinEffect(state.players[winner], state.icons[winner] || '', maxScore);
         updateScoreBoard();
+        pushState();
     }
 
     function renderDice(anim) {
