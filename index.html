@@ -283,17 +283,19 @@
     </div>
     <div id="joinScreen" class="setup" style="display:none">
         <h2>Join a Remote Game</h2>
-        <p style="text-align:center;opacity:.85;margin:8px 0 16px">Enter the 6-letter code the host shared. You'll then pick which player you are.</p>
+        <p style="text-align:center;opacity:.85;margin:8px 0 16px">Enter the 6-letter code the host shared, then your name.</p>
         <div class="setup-row" style="justify-content:center;flex-wrap:wrap;gap:14px">
             <label for="joinCodeInput" style="font-size:1.05em">Room code:</label>
             <input type="text" id="joinCodeInput" maxlength="6" autocomplete="off" autocapitalize="characters" style="font-size:1.4em;letter-spacing:0.2em;text-transform:uppercase;width:9ch;text-align:center;padding:6px 10px">
         </div>
-        <div id="joinSlotSection" style="margin-top:18px;text-align:center">
-            <div id="joinSlotPrompt" style="opacity:.85;margin-bottom:10px">Enter a room code above — the host's players will appear here.</div>
-            <div id="joinSlotPicker" style="display:flex;flex-direction:column;gap:8px;max-width:340px;margin:0 auto"></div>
+        <div id="joinRoomInfo" style="margin-top:14px;text-align:center;opacity:.85;min-height:1.4em"></div>
+        <div class="setup-row" style="justify-content:center;flex-wrap:wrap;gap:14px;margin-top:8px">
+            <label for="joinNameInput" style="font-size:1.05em">Your name:</label>
+            <input type="text" id="joinNameInput" placeholder="Your name" style="padding:8px 12px;font-size:1.05em;width:16ch">
         </div>
         <div id="joinStatus" style="text-align:center;min-height:1.4em;margin:14px 0;opacity:.9"></div>
         <div style="margin-top:14px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
+            <button id="joinSubmitBtn" style="background:#2ecc71;font-size:1.1em;padding:12px 26px">Join Game</button>
             <button id="joinCancelBtn" style="font-size:.95em;padding:12px 22px">← Back to Local</button>
         </div>
     </div>
@@ -558,10 +560,10 @@
         joinRoomBtn: document.getElementById('joinRoomBtn'),
         cancelHostBtn: document.getElementById('cancelHostBtn'),
         joinCodeInput: document.getElementById('joinCodeInput'),
-        joinSlotSection: document.getElementById('joinSlotSection'),
-        joinSlotPrompt: document.getElementById('joinSlotPrompt'),
-        joinSlotPicker: document.getElementById('joinSlotPicker'),
+        joinRoomInfo: document.getElementById('joinRoomInfo'),
+        joinNameInput: document.getElementById('joinNameInput'),
         joinStatus: document.getElementById('joinStatus'),
+        joinSubmitBtn: document.getElementById('joinSubmitBtn'),
         joinCancelBtn: document.getElementById('joinCancelBtn'),
         winScore: document.getElementById('winScore'),
         targetScore: document.getElementById('targetScore'),
@@ -929,30 +931,31 @@
         return false;
     }
 
-    // Cached room fetched during the lookup step, so clicking a slot button doesn't re-fetch.
+    // Cached room fetched during the lookup step, so submitting Join doesn't re-fetch.
     let pendingJoinRoom = null;
     let pendingJoinCode = null;
     let joinLookupTimer = null;
 
-    function renderJoinSlots() {
+    function renderJoinRoomInfo() {
         if (!pendingJoinRoom) {
-            els.joinSlotPicker.innerHTML = '';
-            els.joinSlotPrompt.textContent = 'Enter a room code above — the host’s players will appear here.';
+            els.joinRoomInfo.textContent = '';
             return;
         }
         const players = pendingJoinRoom.state.players || [];
         const icons = pendingJoinRoom.state.icons || [];
-        els.joinSlotPrompt.textContent = `Pick which player you are:`;
-        els.joinSlotPicker.innerHTML = players.map((p, i) =>
-            `<button type="button" class="join-slot-btn" data-name="${p.replace(/"/g, '&quot;')}" style="padding:12px 18px;font-size:1.1em;background:rgba(255,255,255,.15);border:1px solid var(--panel-border);border-radius:8px;cursor:pointer;color:inherit;font-family:inherit">${icons[i] || '•'} ${p}</button>`
-        ).join('');
+        if (!players.length) {
+            els.joinRoomInfo.textContent = '(Room is empty — you’ll be the first player.)';
+        } else {
+            const list = players.map((p, i) => `${icons[i] || '•'} ${p}`).join(', ');
+            els.joinRoomInfo.innerHTML = `<span style="font-size:.92em">Currently in this room: <strong>${list}</strong></span>`;
+        }
     }
 
     async function lookupRoomForJoin(code) {
         els.joinStatus.textContent = '⏳ Looking up room…';
         pendingJoinRoom = null;
         pendingJoinCode = null;
-        renderJoinSlots();
+        renderJoinRoomInfo();
         let room;
         try { room = await roomApi.get(code); }
         catch (e) {
@@ -967,12 +970,49 @@
         pendingJoinRoom = room;
         pendingJoinCode = code;
         els.joinStatus.textContent = '';
-        renderJoinSlots();
+        renderJoinRoomInfo();
+    }
+
+    // Append a player to the room via CAS update. Retries on 409 (concurrent joiners).
+    // Returns {slotIdx, room} on success, or {error} on failure.
+    async function appendPlayerToRoom(code, name, room) {
+        let attempts = 0;
+        while (attempts++ < 5) {
+            const cur = room.state;
+            const players = cur.players || [];
+            // Race-safe: if a concurrent joiner already inserted this exact name, claim it.
+            const existing = players.findIndex(p => p.toLowerCase() === name.toLowerCase());
+            if (existing >= 0) return { slotIdx: existing, room };
+            const nextState = {
+                ...cur,
+                players: [...players, name],
+                icons: [...(cur.icons || []), ICON_LIST[players.length % ICON_LIST.length]],
+                isAI: [...(cur.isAI || []), false],
+                scores: [...(cur.scores || []), 0],
+                farkleStreak: [...(cur.farkleStreak || []), 0],
+            };
+            const res = await roomApi.post(code, {
+                expectedVersion: room.version,
+                state: nextState,
+            });
+            if (res.status === 200) {
+                return { slotIdx: nextState.players.length - 1, room: res.body };
+            }
+            if (res.status === 409) {
+                const fresh = await roomApi.get(code);
+                if (!fresh) return { error: 'Room disappeared.' };
+                room = fresh;
+                continue;
+            }
+            return { error: `Server error ${res.status}: ${res.body?.error || 'unknown'}` };
+        }
+        return { error: 'Too many concurrent joiners — try again.' };
     }
 
     async function joinRoom(code, name, preloaded) {
         if (!ROOM_CODE_RE.test(code || '')) { els.joinStatus.textContent = '❌ Code must be 6 uppercase letters.'; return; }
-        if (!name) { els.joinStatus.textContent = '❌ Pick a player.'; return; }
+        if (!name || !name.trim()) { els.joinStatus.textContent = '❌ Enter your name.'; return; }
+        name = name.trim();
         els.joinStatus.textContent = '⏳ Joining…';
         let room = preloaded;
         if (!room) {
@@ -981,10 +1021,13 @@
             if (!room) { els.joinStatus.textContent = `❌ No room with code ${code}.`; return; }
         }
 
-        const slotIdx = room.state.players.findIndex(p => p.toLowerCase() === name.toLowerCase());
+        // Smart match: existing slot with same name → claim it. Otherwise append a new player.
+        let slotIdx = room.state.players.findIndex(p => p.toLowerCase() === name.toLowerCase());
         if (slotIdx < 0) {
-            els.joinStatus.textContent = `❌ "${name}" isn’t a player in this game. Players: ${room.state.players.join(', ')}.`;
-            return;
+            const appended = await appendPlayerToRoom(code, name, room);
+            if (appended.error) { els.joinStatus.textContent = `❌ ${appended.error}`; return; }
+            room = appended.room;
+            slotIdx = appended.slotIdx;
         }
 
         roomCode = code;
@@ -993,7 +1036,7 @@
         multiplayerMode = 'join';
         roomCreated = true;  // joiner's pushes are now allowed
         applyStateFromWire(room.state);
-        myPlayerName = state.players[slotIdx];  // canonical casing from host
+        myPlayerName = state.players[slotIdx];  // canonical casing
         history.replaceState({}, '', `${location.pathname}?room=${code}`);
 
         // Switch to game screen.
@@ -1033,23 +1076,29 @@
             setMultiplayerMode('local');
         };
         // Auto-lookup the room as the code is typed/pasted. 400ms debounce avoids
-        // a flurry of fetches while the user is mid-typing a 6-char code.
+        // a flurry of fetches while the user is mid-typing a 6-char code. The lookup
+        // only refreshes the "Currently in this room" info; the actual join requires
+        // clicking Join Game so the user can type their name first.
         els.joinCodeInput.addEventListener('input', () => {
             const code = (els.joinCodeInput.value || '').toUpperCase().trim();
             els.joinCodeInput.value = code;  // mirror uppercase back
             clearTimeout(joinLookupTimer);
             pendingJoinRoom = null;
             pendingJoinCode = null;
-            renderJoinSlots();
+            renderJoinRoomInfo();
             els.joinStatus.textContent = '';
             if (!ROOM_CODE_RE.test(code)) return;
             joinLookupTimer = setTimeout(() => lookupRoomForJoin(code), 400);
         });
-        // Pick-a-slot click → join immediately as that player.
-        els.joinSlotPicker.addEventListener('click', (e) => {
-            const btn = e.target.closest('.join-slot-btn');
-            if (!btn || !pendingJoinCode) return;
-            joinRoom(pendingJoinCode, btn.dataset.name, pendingJoinRoom);
+        // Submit → join (or claim existing slot) using the typed name.
+        els.joinSubmitBtn.onclick = () => {
+            const code = (els.joinCodeInput.value || '').toUpperCase().trim();
+            const name = (els.joinNameInput.value || '').trim();
+            joinRoom(code, name, pendingJoinCode === code ? pendingJoinRoom : null);
+        };
+        // Enter key on name input submits join.
+        els.joinNameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); els.joinSubmitBtn.click(); }
         });
 
         els.addPlayer.onclick = () => {
