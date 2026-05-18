@@ -283,14 +283,17 @@
     </div>
     <div id="joinScreen" class="setup" style="display:none">
         <h2>Join a Remote Game</h2>
-        <p style="text-align:center;opacity:.85;margin:8px 0 16px">Enter the 6-letter code the host shared with you.</p>
+        <p style="text-align:center;opacity:.85;margin:8px 0 16px">Enter the 6-letter code the host shared. You'll then pick which player you are.</p>
         <div class="setup-row" style="justify-content:center;flex-wrap:wrap;gap:14px">
-            <span><label for="joinCodeInput" style="font-size:1.05em;margin-right:6px">Room code:</label><input type="text" id="joinCodeInput" maxlength="6" autocomplete="off" autocapitalize="characters" style="font-size:1.4em;letter-spacing:0.2em;text-transform:uppercase;width:9ch;text-align:center;padding:6px 10px"></span>
-            <span><label for="joinNameInput" style="font-size:1.05em;margin-right:6px">Your name:</label><input type="text" id="joinNameInput" placeholder="Your name" style="padding:6px 10px;width:14ch"></span>
+            <label for="joinCodeInput" style="font-size:1.05em">Room code:</label>
+            <input type="text" id="joinCodeInput" maxlength="6" autocomplete="off" autocapitalize="characters" style="font-size:1.4em;letter-spacing:0.2em;text-transform:uppercase;width:9ch;text-align:center;padding:6px 10px">
+        </div>
+        <div id="joinSlotSection" style="margin-top:18px;text-align:center">
+            <div id="joinSlotPrompt" style="opacity:.85;margin-bottom:10px">Enter a room code above — the host's players will appear here.</div>
+            <div id="joinSlotPicker" style="display:flex;flex-direction:column;gap:8px;max-width:340px;margin:0 auto"></div>
         </div>
         <div id="joinStatus" style="text-align:center;min-height:1.4em;margin:14px 0;opacity:.9"></div>
         <div style="margin-top:14px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
-            <button id="joinSubmitBtn" style="background:#2ecc71;font-size:1.1em;padding:12px 26px">Join Game</button>
             <button id="joinCancelBtn" style="font-size:.95em;padding:12px 22px">← Back to Local</button>
         </div>
     </div>
@@ -555,9 +558,10 @@
         joinRoomBtn: document.getElementById('joinRoomBtn'),
         cancelHostBtn: document.getElementById('cancelHostBtn'),
         joinCodeInput: document.getElementById('joinCodeInput'),
-        joinNameInput: document.getElementById('joinNameInput'),
+        joinSlotSection: document.getElementById('joinSlotSection'),
+        joinSlotPrompt: document.getElementById('joinSlotPrompt'),
+        joinSlotPicker: document.getElementById('joinSlotPicker'),
         joinStatus: document.getElementById('joinStatus'),
-        joinSubmitBtn: document.getElementById('joinSubmitBtn'),
         joinCancelBtn: document.getElementById('joinCancelBtn'),
         winScore: document.getElementById('winScore'),
         targetScore: document.getElementById('targetScore'),
@@ -744,7 +748,11 @@
         } else if (mode === 'join') {
             els.setup.style.display = 'none';
             els.joinScreen.style.display = '';
-            if (roomCode && els.joinCodeInput) els.joinCodeInput.value = roomCode;
+            if (roomCode && els.joinCodeInput) {
+                els.joinCodeInput.value = roomCode;
+                // Auto-look-up so the slot picker populates without an extra click.
+                lookupRoomForJoin(roomCode);
+            }
         }
     }
 
@@ -921,20 +929,61 @@
         return false;
     }
 
-    async function joinRoom() {
-        const code = (els.joinCodeInput.value || '').toUpperCase().trim();
-        const name = (els.joinNameInput.value || '').trim();
-        if (!ROOM_CODE_RE.test(code)) { els.joinStatus.textContent = '❌ Code must be 6 uppercase letters.'; return; }
-        if (!name) { els.joinStatus.textContent = '❌ Enter your name.'; return; }
-        els.joinStatus.textContent = '⏳ Joining…';
+    // Cached room fetched during the lookup step, so clicking a slot button doesn't re-fetch.
+    let pendingJoinRoom = null;
+    let pendingJoinCode = null;
+    let joinLookupTimer = null;
+
+    function renderJoinSlots() {
+        if (!pendingJoinRoom) {
+            els.joinSlotPicker.innerHTML = '';
+            els.joinSlotPrompt.textContent = 'Enter a room code above — the host’s players will appear here.';
+            return;
+        }
+        const players = pendingJoinRoom.state.players || [];
+        const icons = pendingJoinRoom.state.icons || [];
+        els.joinSlotPrompt.textContent = `Pick which player you are:`;
+        els.joinSlotPicker.innerHTML = players.map((p, i) =>
+            `<button type="button" class="join-slot-btn" data-name="${p.replace(/"/g, '&quot;')}" style="padding:12px 18px;font-size:1.1em;background:rgba(255,255,255,.15);border:1px solid var(--panel-border);border-radius:8px;cursor:pointer;color:inherit;font-family:inherit">${icons[i] || '•'} ${p}</button>`
+        ).join('');
+    }
+
+    async function lookupRoomForJoin(code) {
+        els.joinStatus.textContent = '⏳ Looking up room…';
+        pendingJoinRoom = null;
+        pendingJoinCode = null;
+        renderJoinSlots();
         let room;
         try { room = await roomApi.get(code); }
-        catch (e) { els.joinStatus.textContent = '❌ Network error. Try again.'; return; }
-        if (!room) { els.joinStatus.textContent = `❌ No room with code ${code}.`; return; }
+        catch (e) {
+            console.error('[mp] lookup error', e);
+            els.joinStatus.textContent = '❌ Network error looking up the room.';
+            return;
+        }
+        if (!room) {
+            els.joinStatus.textContent = `❌ No room with code ${code}. Double-check with the host.`;
+            return;
+        }
+        pendingJoinRoom = room;
+        pendingJoinCode = code;
+        els.joinStatus.textContent = '';
+        renderJoinSlots();
+    }
+
+    async function joinRoom(code, name, preloaded) {
+        if (!ROOM_CODE_RE.test(code || '')) { els.joinStatus.textContent = '❌ Code must be 6 uppercase letters.'; return; }
+        if (!name) { els.joinStatus.textContent = '❌ Pick a player.'; return; }
+        els.joinStatus.textContent = '⏳ Joining…';
+        let room = preloaded;
+        if (!room) {
+            try { room = await roomApi.get(code); }
+            catch (e) { els.joinStatus.textContent = '❌ Network error. Try again.'; return; }
+            if (!room) { els.joinStatus.textContent = `❌ No room with code ${code}.`; return; }
+        }
 
         const slotIdx = room.state.players.findIndex(p => p.toLowerCase() === name.toLowerCase());
         if (slotIdx < 0) {
-            els.joinStatus.textContent = `❌ "${name}" isn't a player in this game. Players: ${room.state.players.join(', ')}.`;
+            els.joinStatus.textContent = `❌ "${name}" isn’t a player in this game. Players: ${room.state.players.join(', ')}.`;
             return;
         }
 
@@ -979,9 +1028,29 @@
         els.joinCancelBtn.onclick = () => {
             // Strip ?room= from URL when bailing out, so reload doesn't bounce back here.
             if (location.search) history.replaceState({}, '', location.pathname);
+            pendingJoinRoom = null;
+            pendingJoinCode = null;
             setMultiplayerMode('local');
         };
-        els.joinSubmitBtn.onclick = joinRoom;
+        // Auto-lookup the room as the code is typed/pasted. 400ms debounce avoids
+        // a flurry of fetches while the user is mid-typing a 6-char code.
+        els.joinCodeInput.addEventListener('input', () => {
+            const code = (els.joinCodeInput.value || '').toUpperCase().trim();
+            els.joinCodeInput.value = code;  // mirror uppercase back
+            clearTimeout(joinLookupTimer);
+            pendingJoinRoom = null;
+            pendingJoinCode = null;
+            renderJoinSlots();
+            els.joinStatus.textContent = '';
+            if (!ROOM_CODE_RE.test(code)) return;
+            joinLookupTimer = setTimeout(() => lookupRoomForJoin(code), 400);
+        });
+        // Pick-a-slot click → join immediately as that player.
+        els.joinSlotPicker.addEventListener('click', (e) => {
+            const btn = e.target.closest('.join-slot-btn');
+            if (!btn || !pendingJoinCode) return;
+            joinRoom(pendingJoinCode, btn.dataset.name, pendingJoinRoom);
+        });
 
         els.addPlayer.onclick = () => {
             if (els.playerList.children.length >= 6) return alert('Max 6 players');
@@ -1449,6 +1518,27 @@
     }
 
     function updateButtonStates() {
+        // In remote games, joiners (and any waiting player) have no agency over the active turn.
+        if (multiplayerMode !== 'local' && !isMyTurn()) {
+            els.rollBtn.disabled = true;
+            els.bankBtn.disabled = true;
+            return;
+        }
+        // Pre-roll state — Roll is enabled regardless of selection. This branch matters for
+        // joiners who pull initial state via poll/join; without it updateButtonStates would
+        // incorrectly disable Roll because no rollScore is in the state yet.
+        const isPreRoll = !state.hotDicePending
+            && state.dice.every(v => v === 0)
+            && state.locked.size === 0
+            && state.selected.size === 0;
+        if (isPreRoll) {
+            els.rollBtn.disabled = false;
+            els.rollBtn.innerHTML = '<span aria-hidden="true">🎲</span> Roll Dice';
+            els.bankBtn.disabled = true;
+            els.bankBtn.innerHTML = '<span aria-hidden="true">💰</span> Bank Score';
+            updateRuleHint();
+            return;
+        }
         const exact = activeRuleset.rules.exactScoreWin;
         const myScore = state.scores[state.currentPlayer] || 0;
         if (state.hotDicePending) {
